@@ -25,13 +25,14 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
-#include <arkClient.h>
-#include <arkCrypto.h>
 
+#include "connection/connection.h"  // <- from C++ Client
+
+// C++ Crypto Headers
 #include "crypto/hash.hpp"
-#include "networks/mainnet.hpp"
 #include "transactions/builders/builder.hpp"
 #include "utils/hex.hpp"
+#include "utils/json.h"
 
 using namespace Ark::Client;
 using namespace Ark::Crypto;
@@ -41,65 +42,21 @@ using namespace Ark::Crypto::transactions;
 // const char* password = "yourPassword";
 #include "secret.h"
 
+////////////////////////////////////////////////////////////////////////////////
+// Globals
 Connection<Api> client("167.114.29.52", 4003);
-
 char chipHash[HASH_64_LEN + 1] = {'0'};
 
-uint64_t getWalletNonce(Connection<Api>& client, const char* address) {
-  const auto walletResponse = client.api.wallets.get(address);
-
-  const size_t capacity =
-      JSON_OBJECT_SIZE(0) + JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(6) + 160;
-  DynamicJsonDocument doc(capacity);
-  deserializeJson(doc, walletResponse);
-  uint64_t nonce = doc["data"]["nonce"];
-
-  return nonce + 1 ?: 1;
-}
-
-void idHashToBuffer(char hashBuffer[64]) {
-  int idByteLen = 6;
+////////////////////////////////////////////////////////////////////////////////
+// Helper Functions
+void createHash(char hashBuffer[64]) {
   uint64_t chipId = ESP.getEfuseMac();
-  uint8_t* bytArray = *reinterpret_cast<uint8_t(*)[sizeof(uint64_t)]>(&chipId);
-  std::reverse(&bytArray[0], &bytArray[idByteLen]);
-  const auto shaHash = Hash::sha256(&bytArray[0], idByteLen);
+  uint8_t byteArray[8];
+  memmove(byteArray, &chipId, sizeof(uint64_t));
+  const auto shaHash = Hash::sha256(&byteArray[0], sizeof(uint64_t));
   memmove(hashBuffer,
           BytesToHex(&shaHash[0], &shaHash[0] + HASH_32_LEN).c_str(),
           HASH_64_LEN);
-}
-
-Transaction createTransaction() {
-  const auto nonce = getWalletNonce(client, RECIPIENT_ID);
-
-  // Get a SHA256 Hash of the ESP32's Chip ID/MAC address.
-  idHashToBuffer(chipHash);
-
-  const auto transaction = builder::Transfer()
-                               .nonce(nonce)
-                               .amount(1)
-                               .expiration(0)
-                               .recipientId(RECIPIENT_ID)
-                               .vendorField(chipHash)
-                               .sign(PASSPHRASE)
-                               .build();
-
-  Serial.printf("\nNew Transaction: %s", transaction.toJson().c_str());
-  return transaction;
-}
-
-void sendTransaction() {
-  const auto transaction = createTransaction();
-  auto txPayload = "{\"transactions\":[" + transaction.toJson() + "]}";
-
-  const auto broadcastResponse = client.api.transactions.send(txPayload);
-  Serial.printf("\nbroadcastResponse: %s\n", broadcastResponse.c_str());
-}
-
-bool txWasFound() {
-  const auto txSearchResponse =
-      client.api.wallets.transactionsReceived(RECIPIENT_ID, "?page=1&limit=3");
-
-  return txSearchResponse.find(chipHash) < txSearchResponse.length();
 }
 
 void blink() {
@@ -117,12 +74,65 @@ void blink() {
   esp_deep_sleep_start();
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Methods using the ARK C++ Client API
+
+uint64_t getWalletNonce(Connection<Api>& client, const char* address) {
+  const auto walletResponse = client.api.wallets.get(address);
+
+  const size_t capacity =
+      JSON_OBJECT_SIZE(0) + JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(6) + 160;
+  DynamicJsonDocument doc(capacity);
+  deserializeJson(doc, walletResponse);
+  uint64_t nonce = doc["data"]["nonce"];
+
+  return nonce + 1;
+}
+
+// Create a Transaction using the Wallet Nonce and Board ChipId Hash.
+Transaction createTransaction() {
+  const auto nonce = getWalletNonce(client, RECIPIENT_ID);
+  createHash(chipHash);
+
+  const auto transaction = builder::Transfer()
+                               .nonce(nonce)
+                               .amount(1)
+                               .expiration(0)
+                               .recipientId(RECIPIENT_ID)
+                               .vendorField(chipHash)
+                               .sign(PASSPHRASE)
+                               .build();
+
+  Serial.printf("\n\nNew Transaction:\n%s\n\n", transaction.toJson().c_str());
+
+  return transaction;
+}
+
+// Broadcast a Transaction using the 'createTransaction()' method.
+void sendTransaction() {
+  const auto transaction = createTransaction();
+  auto txPayload = "{\"transactions\":[" + transaction.toJson() + "]}";
+
+  const auto broadcastResponse = client.api.transactions.send(txPayload);
+  Serial.printf("\nbroadcastResponse: %s\n", broadcastResponse.c_str());
+}
+
+// Search for the broadcast Transaction using the ChipId Hash.
+bool txWasFound() {
+  const auto txSearchResponse =
+      client.api.wallets.transactionsReceived(RECIPIENT_ID, "?page=1&limit=3");
+
+  return txSearchResponse.find(chipHash) < txSearchResponse.length();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Sketch Methods
 void setup() {
   Serial.begin(9600);
 
   WiFi.begin(SSID, PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(1000);
     Serial.print(".");
   }
 
